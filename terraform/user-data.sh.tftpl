@@ -1,0 +1,54 @@
+#!/bin/bash
+exec > /var/log/user-data.log 2>&1
+set -x
+
+# web stack from amazon linux repos (reached via s3 endpoint, no internet needed)
+dnf install -y httpd php php-mysqlnd
+
+SECRET_ARN="${secret_arn}"
+DB_HOST="${db_host}"
+
+# fetch creds, retry until the secretsmanager endpoint is ready
+SECRET_JSON=""
+for i in $(seq 1 20); do
+  SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --region ca-central-1 --query SecretString --output text 2>/dev/null)
+  if [ -n "$SECRET_JSON" ]; then break; fi
+  echo "waiting for secretsmanager, attempt $i"
+  sleep 15
+done
+
+DB_USER=$(echo "$SECRET_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['username'])")
+DB_PASS=$(echo "$SECRET_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['password'])")
+
+# generated on the box at boot - no secrets in the repo
+cat > /var/www/html/config.php <<CFG
+<?php
+return [
+  "host" => "$DB_HOST",
+  "user" => "$DB_USER",
+  "pass" => "$DB_PASS",
+  "db"   => "appdb"
+];
+CFG
+
+cat > /var/www/html/index.php <<'PHPEOF'
+<?php
+$config = require "/var/www/html/config.php";
+$conn = new mysqli($config["host"], $config["user"], $config["pass"], $config["db"]);
+if ($conn->connect_error) {
+    http_response_code(500);
+    echo "DB connection failed: " . $conn->connect_error;
+    exit;
+}
+$conn->query("CREATE TABLE IF NOT EXISTS visits (id INT AUTO_INCREMENT PRIMARY KEY, visited_at DATETIME)");
+$conn->query("INSERT INTO visits (visited_at) VALUES (NOW())");
+$res = $conn->query("SELECT COUNT(*) AS c FROM visits");
+$row = $res->fetch_assoc();
+echo "<h1>3-Tier App Working</h1>";
+echo "<p>Connected to RDS MySQL successfully.</p>";
+echo "<p>Total visits recorded in database: " . $row["c"] . "</p>";
+echo "<p>Served by host: " . gethostname() . "</p>";
+$conn->close();
+PHPEOF
+
+systemctl enable --now httpd
